@@ -2,3 +2,4 @@ target/
 result
 .direnv/
 _artifacts/
+tools/pack_lgx
