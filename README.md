@@ -44,6 +44,7 @@ app — they flow as base64 through the module boundary and are registered with
 | `renderer/` | the Rust cdylib (`libosm_renderer`): PBF → spatial index → raster PNG tiles. Unit-tested; `cargo run -p osm-renderer --example render -- <pbf> <region>` smoke-renders a tile. |
 | `app/` | the ui_qml Basecamp app: plugin (routes `map_*` to the cdylib, forwards osm ops to the core), QML slippy-map view, metadata, flake. |
 | `build-ffi.sh` | build the cdylib locally (dev). |
+| `tools/pack_lgx.c` | a tiny C packer that builds a valid `.lgx` from a variant dir using Basecamp's own `liblgx` — lets you produce an installable package on a box without nix (dev/CI-bridge). |
 | `.github/workflows/release.yml` | nix CI: builds the `.lgx` bundles (linux-amd64, windows-x86_64) and publishes them on `osm_renderer-v*` tags. |
 
 ## Build
