@@ -1,0 +1,4 @@
+# Match the codespace box (1.98.1); the renderer is pure Rust (osmpbf + image)
+# with no LEZ-chain dependencies, so any recent stable toolchain also works.
+[toolchain]
+channel = "1.98.1"

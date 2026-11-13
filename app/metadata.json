@@ -1,0 +1,37 @@
+{
+  "name": "osm_renderer",
+  "version": "0.1.0",
+  "display_name": "Map Viewer",
+  "description": "A map renderer that resolves an OSM region via the osm SDK, fetches the verified PBF from Logos Storage by its on-chain CID, and renders the OpenStreetMap data as a pannable, zoomable slippy map.",
+  "type": "ui_qml",
+  "category": "application",
+  "main": "osm_renderer_plugin",
+  "view": "qml/Main.qml",
+  "icon": "src/icons/icon.png",
+  "dependencies": [
+    "osm"
+  ],
+  "include": [
+    "libosm_renderer.so"
+  ],
+  "nix": {
+    "packages": {
+      "build": [],
+      "runtime": []
+    },
+    "external_libraries": [
+      {
+        "name": "osm_renderer",
+        "vendor_path": "../renderer"
+      }
+    ],
+    "cmake": {
+      "find_packages": [],
+      "extra_sources": [],
+      "extra_include_dirs": [],
+      "extra_link_libraries": [
+        "dl"
+      ]
+    }
+  }
+}
