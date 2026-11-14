@@ -22,12 +22,6 @@ jobs:
       matrix:
         target: [linux-amd64, windows-x86_64]
         module: [renderer, app]
-        exclude:
-          # The renderer core is a Rust cdylib; the windows variant is produced
-          # by the builder's mingw cross-build (x86_64-windows). Both legs
-          # build it; this matrix just names them.
-          - module: renderer
-            target: irrelevant
     steps:
       - uses: actions/checkout@v4
 
@@ -38,15 +32,24 @@ jobs:
 
       - name: Build ${{ matrix.module }} .lgx (portable)
         working-directory: ${{ matrix.module }}
+        env:
+          # linux-amd64 builds the local system; windows-x86_64 cross-builds
+          # the x86_64-windows variant (a mingw build realised on the Linux
+          # runner, the same way the osm catalog release does it).
+          LGX_ATTR: ${{ matrix.target == 'windows-x86_64' && 'packages.x86_64-windows.lgx-portable' || 'lgx-portable' }}
         run: |
-          nix build ".#lgx-portable" --print-out-paths --no-link
-          out="$(readlink -f result)"
+          set -euo pipefail
+          # --print-out-paths prints the store path; --no-link avoids creating
+          # a `result` symlink (so we must NOT readlink `result`).
+          out=$(nix build ".#${LGX_ATTR}" --print-out-paths --no-link \
+                  --override-input osm-renderer-core github:aegonmyy/osm-renderer?dir=renderer)
           lgx=$(find "$out" -maxdepth 2 -name '*.lgx' | head -n1)
-          if [[ -z "$lgx" ]]; then echo "::error::nix build produced no .lgx"; exit 1; fi
+          if [[ -z "$lgx" ]]; then echo "::error::nix build produced no .lgx (out=$out)"; exit 1; fi
           mkdir -p "$GITHUB_WORKSPACE/_artifacts"
           name="osm_renderer"
           [[ "${{ matrix.module }}" == "renderer" ]] && name="osm_renderer_core"
           cp "$lgx" "$GITHUB_WORKSPACE/_artifacts/${name}-${{ matrix.target }}.lgx"
+          echo "built $name ${{ matrix.target }}: $lgx"
 
       - uses: actions/upload-artifact@v4
         with:

@@ -11,7 +11,10 @@
   outputs = inputs@{ self, logos-module-builder, ... }:
     let
       nixpkgs = logos-module-builder.inputs.nixpkgs;
-      systems = [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" ];
+      # x86_64-windows is a mingw cross-build realised on a Linux runner;
+      # the builder bakes its pinned logos-nix into lib, so mkLogosModule
+      # already produces a packages.x86_64-windows attribute.
+      systems = [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" "x86_64-windows" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems f;
     in {
       packages = forAllSystems (system:
