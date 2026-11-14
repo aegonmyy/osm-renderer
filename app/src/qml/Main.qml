@@ -229,7 +229,7 @@ Rectangle {
         onTriggered: tick()
     }
 
-    Component.onCompleted: { console.log("SandboxImages typeof:", typeof SandboxImages, "| logos typeof:", typeof logos); fire("open", {}) }
+    Component.onCompleted: { console.log("tilesDir:", root.tilesDir); fire("open", {}) }
 
     // Pump the tile queue: request the next tile (serialized, one in flight).
     // Called from onResult after a tile completes and from relayout to start.
