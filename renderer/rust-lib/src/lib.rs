@@ -91,7 +91,20 @@ fn dispatch(name: &str, args: &Value) -> Value {
             if png.is_empty() {
                 return json!({ "ok": false, "error": "no map ready" });
             }
-            json!({ "ok": true, "result": { "data_url": format!("data:image/png;base64,{}", b64(&png)) } })
+            // Write the PNG to a file under the app's install dir (the QML
+            // sandbox blocks http/file/data image sources EXCEPT local files
+            // inside the app's allowed roots). The QML passes `out_dir` (a
+            // local path under its install dir); we write z_x_y.png there and
+            // return the file:// URL the QML binds to Image.source.
+            let out_dir = str_arg(args, "out_dir").unwrap_or_else(|| "/tmp/osm_renderer_tiles".to_string());
+            let _ = std::fs::create_dir_all(&out_dir);
+            let fname = format!("{}_{}_{}.png", z, x, y);
+            let fpath = std::path::Path::new(&out_dir).join(&fname);
+            if std::fs::write(&fpath, &png).is_err() {
+                return json!({ "ok": false, "error": format!("cannot write tile to {}", fpath.display()) });
+            }
+            let url = format!("file://{}", fpath.display());
+            json!({ "ok": true, "result": { "url": url } })
         }
         "map_status" => json!({ "ok": true, "result": map::status() }),
         "map_stop" => {

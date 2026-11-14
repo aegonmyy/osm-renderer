@@ -25,12 +25,21 @@ Rectangle {
     color: "#0b1512"
 
     readonly property var bk: logos.module("osm_renderer")
+    // The tiles dir under the app's install dir (a sandbox-allowed root, so
+    // file:// URLs there load in Image.source). Resolved from the QML's own
+    // location. The renderer writes z_x_y.png here and returns the file:// URL.
+    readonly property string tilesDir: {
+        // Qt.resolvedUrl(".") -> "file:///.../plugins/osm_renderer/qml/"
+        const here = Qt.resolvedUrl(".").toString()
+        const path = here.replace(/^file:\/\//, "").replace(/\/qml\/$/, "/tiles")
+        return path
+    }
     property string lastErr: ""
     property var regionList: []
     property string mapState: "idle"   // idle | preparing | ready | error
     property string mapError: ""
     property string fetchJobId: ""
-    var mapInfo: ({})
+    property var mapInfo: ({})
     property string mapRegion: ""
 
     // View state (the slippy map).
@@ -151,9 +160,10 @@ Rectangle {
             }
         } else if (op === "map_render_tile") {
             const t = ctx.tile
-            if (r.ok && r.result && r.result.data_url && t) {
-                const src = SandboxImages.sourceFor(r.result.data_url)
-                gridModel.setProperty(t.i, "url", src)
+            if (r.ok && r.result && r.result.url && t) {
+                // The renderer wrote the tile PNG into the app's install dir
+                // (a sandbox-allowed root); Image.source takes the file:// URL.
+                gridModel.setProperty(t.i, "url", r.result.url)
             } else if (t) {
                 gridModel.setProperty(t.i, "url", "")
             }
@@ -202,29 +212,41 @@ Rectangle {
         root.mapInfo = ({})
     }
 
-    // Poll a fetch job (osm core job_status; routed above).
+    // Poll a fetch job (osm core job_status; routed above). Always fire: the
+    // result channel occasionally drops a frame, and gating on pendingOp would
+    // then stall the poll forever. job_status is idempotent + uncorrelated.
     Timer {
         id: fetchPoll
         interval: 1000; repeat: true
-        onTriggered: { if (root.fetchJobId && !root.pendingOp) fire("job_status", { job_id: root.fetchJobId }) }
+        onTriggered: { if (root.fetchJobId) { root.pendingOp = ""; fire("job_status", { job_id: root.fetchJobId }) } }
     }
 
-    // Poll the renderer build state (routed above).
+    // Poll the renderer build state (routed above). Same rationale: always fire.
     Timer {
         id: statusPoll
         interval: 1000; repeat: true
-        function tick() { if (!root.pendingOp) fire("map_status", {}) }
+        function tick() { root.pendingOp = ""; fire("map_status", {}) }
         onTriggered: tick()
     }
 
-    Component.onCompleted: fire("open", {})
+    Component.onCompleted: { console.log("SandboxImages typeof:", typeof SandboxImages, "| logos typeof:", typeof logos); fire("open", {}) }
 
     // Pump the tile queue: request the next tile (serialized, one in flight).
+    // Called from onResult after a tile completes and from relayout to start.
     function pumpTiles() {
-        if (root.pendingOp) return
         if (root.tileQueue.length === 0) return
         const t = root.tileQueue.shift()
-        fire("map_render_tile", { z: t.z, x: t.x, y: t.y }, { tile: t })
+        fire("map_render_tile", { z: t.z, x: t.x, y: t.y, out_dir: root.tilesDir }, { tile: t })
+    }
+
+    // Relayout watchdog: the viewport's Layout dimensions may still be 0 when
+    // the first viewTick fires (the ColumnLayout hasn't settled yet), so
+    // relayout returns without queueing tiles. Retry until the grid is filled.
+    Timer {
+        id: relayoutTimer
+        interval: 500; repeat: true
+        running: root.mapState === "ready" && gridModel.count === 0
+        onTriggered: viewport.relayout()
     }
 
     ColumnLayout {
@@ -257,9 +279,8 @@ Rectangle {
                         Button {
                             text: root.mapState === "ready" ? "Re-render" : "Render map"
                             enabled: root.mapState !== "preparing"
-                                       && regionPicker.currentValue !== undefined
-                                       && String(regionPicker.currentValue).length > 0
-                            onClicked: root.startMap(String(regionPicker.currentValue))
+                                       && regionPicker.currentText.length > 0
+                            onClicked: root.startMap(regionPicker.currentText)
                             font.family: "DejaVu Sans"
                         }
                         Button {
@@ -297,6 +318,10 @@ Rectangle {
                     Text { visible: root.mapState === "error"
                         text: root.mapError; font.family: "DejaVu Sans Mono"; font.pixelSize: 11
                         color: "#c0654e"; wrapMode: Text.Wrap; Layout.maximumWidth: 360 }
+                    Text { visible: root.mapState === "error"
+                        text: "last: " + String(root.bk ? root.bk.lastResult : "").substring(0, 140)
+                        font.family: "DejaVu Sans Mono"; font.pixelSize: 9
+                        color: Qt.rgba(0.961,0.961,0.941,0.40); wrapMode: Text.Wrap; Layout.maximumWidth: 360 }
                 }
             }
         }
@@ -396,6 +421,14 @@ Rectangle {
                 text: "data distributed on Logos · renderer: osm_renderer_core"
                 font.family: "DejaVu Sans Mono"; font.pixelSize: 10
                 color: Qt.rgba(0.961,0.961,0.941,0.30) }
+            Text { anchors.left: parent.left; anchors.top: parent.top; anchors.margins: 8
+                text: "vp " + Math.round(viewport.vpW) + "x" + Math.round(viewport.vpH)
+                      + "  grid " + gridModel.count + "  queue " + root.tileQueue.length
+                      + "  pend " + root.pendingOp
+                      + "  lastLen " + (root.bk ? root.bk.lastResult.length : -1)
+                      + "  lastHead " + String(root.bk ? root.bk.lastResult : "").substring(0, 60)
+                font.family: "DejaVu Sans Mono"; font.pixelSize: 10
+                color: "#ffd328" }
 
             Connections {
                 target: root
