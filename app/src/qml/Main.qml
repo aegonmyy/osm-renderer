@@ -23,7 +23,7 @@ Rectangle {
     property var regionList: []
     property string mapState: "idle"   // idle | loading-list | preparing | ready | error
     property string mapError: ""
-    property string prepareJobId: ""
+    property string fetchJobId: ""
     property var mapInfo: ({})
     property string mapRegion: ""
     property string mapPbf: ""
@@ -80,7 +80,7 @@ Rectangle {
         root.mapRegion = region
         root.mapState = "preparing"
         root.mapError = ""
-        root.prepareJobId = ""
+        root.fetchJobId = ""
         // 1. on-chain lookup for cid + md5.
         const lk = root.core("lookup", { region: region })
         if (!lk.ok || !lk.result || !lk.result.latest || !lk.result.latest.cid) {
@@ -94,7 +94,7 @@ Rectangle {
         // 2. fetch from Logos Storage by CID (job: long op).
         const f = root.core("fetch", { region: region, cid: cid, md5_hex: md5, job: true })
         if (f.ok && f.result && f.result.job_id) {
-            root.prepareJobId = f.result.job_id
+            root.fetchJobId = f.result.job_id
             root.mapState = "preparing"
             root.mapError = "fetching region from Logos Storage…"
             fetchPoll.running = true
@@ -128,13 +128,14 @@ Rectangle {
             const rec = cat.result.find(r => r.region === region)
             if (rec) { version = rec.version || 0; md5 = rec.md5 || ""; cid = rec.cid || "" }
         }
-        const r = root.core("map_prepare", { pbf: pbf, region: region, version: version, md5: md5, cid: cid, job: true })
-        if (!r.ok || !r.result || !r.result.job_id) {
+        // map_prepare kicks off a background build in the renderer core and
+        // returns immediately; we poll map_status (NOT job_status) until ready.
+        const r = root.core("map_prepare", { pbf: pbf, region: region, version: version, md5: md5, cid: cid })
+        if (!r.ok) {
             root.mapState = "error"
             root.mapError = (r.error || "map_prepare failed")
             return
         }
-        root.prepareJobId = r.result.job_id
         root.mapState = "preparing"
         root.mapError = "building map index…"
         preparePoll.running = true
@@ -146,13 +147,13 @@ Rectangle {
         id: fetchPoll
         interval: 1000; repeat: true
         function tick() {
-            if (!root.prepareJobId) return
-            const r = root.core("job_status", { job_id: root.prepareJobId })
+            if (!root.fetchJobId) return
+            const r = root.core("job_status", { job_id: root.fetchJobId })
             if (!r.ok || !r.result) return
             const j = r.result
             if (j.state === "running") return
             fetchPoll.running = false
-            root.prepareJobId = ""
+            root.fetchJobId = ""
             if (j.state === "done" && j.result && j.result.path) {
                 root.mapPbf = j.result.path
                 const cat = root.core("catalog", {})
@@ -165,20 +166,18 @@ Rectangle {
         onTriggered: tick()
     }
 
-    // Poll the map_prepare build job; on done, fit the view.
+    // Poll the renderer's map_status until the build is ready (or errors).
     Timer {
         id: preparePoll
         interval: 1000; repeat: true
         function tick() {
-            if (!root.prepareJobId) return
-            const r = root.core("job_status", { job_id: root.prepareJobId })
+            const r = root.core("map_status", {})
             if (!r.ok || !r.result) return
-            const j = r.result
-            if (j.state === "running") return
+            const s = r.result.state
+            if (s === "building") return
             preparePoll.running = false
-            root.prepareJobId = ""
-            if (j.state === "done" && j.result && j.result.info) {
-                root.mapInfo = j.result.info
+            if (s === "ready" && r.result.info) {
+                root.mapInfo = r.result.info
                 const b = root.mapInfo.bounds || null
                 if (b) {
                     root.centerLat = b.center_lat
@@ -188,9 +187,12 @@ Rectangle {
                 }
                 root.mapState = "ready"
                 root.viewTick++
+            } else if (s === "error") {
+                root.mapState = "error"
+                root.mapError = r.result.error || "build failed"
             } else {
                 root.mapState = "error"
-                root.mapError = j.error || "build failed"
+                root.mapError = "build stopped unexpectedly"
             }
         }
         onTriggered: tick()
