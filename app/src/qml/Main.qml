@@ -1,15 +1,21 @@
 // osm_renderer — "Map Viewer". A pannable/zoomable slippy map of an OSM region
 // fetched from Logos Storage by its on-chain CID.
 //
-// The renderer (PBF parse -> spatial index -> raster PNG) lives in
-// libosm_renderer, dlopened by this app's plugin. Tiles come back as
-// data:image/png;base64 URLs because the Basecamp QML sandbox blocks http and
-// file image sources — each tile is handed to the host's SandboxImages
-// capability, which returns an opaque image://sandbox-media/<id> URL only this
-// engine's image provider can resolve.
+// The renderer (PBF parse -> spatial index -> raster PNG) lives in the
+// osm_renderer_core module (a Rust cdylib); region resolution / on-chain
+// lookup / Logos Storage fetch live in the unchanged osm module. This app's
+// plugin forwards ops to both cores over RemoteObjects; QML calls
+// invokeOp(name, argsJson) and reads results from the lastResult PROPERTY —
+// a QML method call on a dynamic replica returns a default value immediately,
+// and property sync is the channel that works (same as osm_app).
 //
-// The plugin forwards osm ops (fetch/catalog/lookup) to the osm core module,
-// and handles map_* ops locally against the renderer cdylib.
+// Ops are serialized through one pending-op slot: results are routed by the
+// "op" tag the cores embed, so at most one op is in flight and no correlation
+// ambiguity exists. Tiles are requested one at a time from a queue.
+//
+// The Basecamp QML sandbox blocks http/file image sources, so each tile is
+// handed to the host's SandboxImages capability as a base64 data URL and the
+// returned image://sandbox-media/<id> URL is bound to the Image source.
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
@@ -21,12 +27,11 @@ Rectangle {
     readonly property var bk: logos.module("osm_renderer")
     property string lastErr: ""
     property var regionList: []
-    property string mapState: "idle"   // idle | loading-list | preparing | ready | error
+    property string mapState: "idle"   // idle | preparing | ready | error
     property string mapError: ""
     property string fetchJobId: ""
-    property var mapInfo: ({})
+    var mapInfo: ({})
     property string mapRegion: ""
-    property string mapPbf: ""
 
     // View state (the slippy map).
     property real centerLat: 0.0
@@ -37,10 +42,134 @@ Rectangle {
     property int  viewTick: 0
     readonly property int tileSize: 256
 
-    function core(op, args) {
-        if (!root.bk) return { ok: false, error: "no backend" }
-        const raw = root.bk.invokeOp(op, JSON.stringify(args || {}))
-        try { return JSON.parse(raw) } catch (e) { return { ok: false, error: String(raw) } }
+    // Serialized op dispatch: fire-and-route via lastResult.
+    property string pendingOp: ""
+    property var pendingCtx: ({})       // per-op context for routing
+    property var tileQueue: []          // [{z,x,y,i}] pending tile requests
+
+    function fire(op, args, ctx) {
+        if (!root.bk) return
+        root.pendingOp = op
+        root.pendingCtx = ctx || ({})
+        root.bk.invokeOp(op, JSON.stringify(args || {}))
+    }
+
+    function onResult(r) {
+        // Route one completed op; defaults no-op so unknown results are safe.
+        const op = r.op || ""
+        const ctx = root.pendingCtx || ({})
+        root.pendingOp = ""
+        root.pendingCtx = ({})
+        if (op === "open") {
+            fire("regions", {})
+        } else if (op === "regions") {
+            if (r.ok && r.result && r.result.regions) {
+                root.regionList = r.result.regions.map(g => ({ path: g.path, name: g.name }))
+                const def = root.regionList.find(g => g.path === "china/henan")
+                regionPicker.currentIndex = root.regionList.indexOf(def || root.regionList[0])
+                root.mapState = "idle"
+            } else {
+                root.mapState = "error"
+                root.mapError = r.error || "no regions from the osm module"
+            }
+        } else if (op === "lookup") {
+            const region = ctx.region || ""
+            if (r.ok && r.result && r.result.latest && r.result.latest.cid) {
+                const latest = r.result.latest
+                fire("fetch", { region: region, cid: latest.cid,
+                                md5_hex: latest.checksum || "", job: true })
+                root.mapError = "fetching region from Logos Storage…"
+            } else {
+                // No on-chain entry: fall back to the local catalog.
+                fire("catalog", {}, { region: region, stage: "catalog-first" })
+            }
+        } else if (op === "fetch") {
+            if (r.ok && r.result && r.result.job_id) {
+                root.fetchJobId = r.result.job_id
+                root.mapState = "preparing"
+                root.mapError = "fetching region from Logos Storage…"
+                fetchPoll.running = true
+            } else {
+                fire("catalog", {}, { region: root.mapRegion, stage: "catalog-after-fetch" })
+            }
+        } else if (op === "job_status") {
+            if (!r.ok || !r.result) { return }
+            const j = r.result
+            if (j.state === "running") return
+            fetchPoll.running = false
+            root.fetchJobId = ""
+            if (j.state === "done" && j.result && j.result.path) {
+                fire("catalog", {}, { region: root.mapRegion, stage: "catalog-fetched", path: j.result.path })
+            } else {
+                root.mapState = "error"
+                root.mapError = j.error || "fetch failed"
+            }
+        } else if (op === "catalog") {
+            const region = ctx.region || root.mapRegion
+            let pbf = ctx.path || ""
+            let version = 0, md5 = "", cid = ""
+            if (r.ok && r.result) {
+                const rec = r.result.find(x => x.region === region)
+                if (rec) { if (!pbf) pbf = rec.path || ""
+                           version = rec.version || 0; md5 = rec.md5 || ""; cid = rec.cid || "" }
+            }
+            if (!pbf) {
+                root.mapState = "error"
+                root.mapError = "no local PBF for '" + region + "'. Fetch it first (osm_app), or check the storage node."
+                return
+            }
+            root.mapState = "preparing"
+            root.mapError = "building map index…"
+            fire("map_prepare", { pbf: pbf, region: region, version: version, md5: md5, cid: cid })
+        } else if (op === "map_prepare") {
+            if (!r.ok) {
+                root.mapState = "error"
+                root.mapError = r.error || "map_prepare failed"
+                return
+            }
+            statusPoll.running = true
+            statusPoll.tick()
+        } else if (op === "map_status") {
+            if (!r.ok || !r.result) return
+            const s = r.result.state
+            if (s === "building") return
+            statusPoll.running = false
+            if (s === "ready" && r.result.info) {
+                root.mapInfo = r.result.info
+                const b = root.mapInfo.bounds || null
+                if (b) {
+                    root.centerLat = b.center_lat
+                    root.centerLon = b.center_lon
+                    root.zoom = Math.max(root.minZoom, Math.min(root.maxZoom,
+                                Math.max(2, (root.mapInfo.fit_zoom || 6) + 1)))
+                }
+                root.mapState = "ready"
+                root.viewTick++
+            } else if (s === "error") {
+                root.mapState = "error"
+                root.mapError = r.result.error || "build failed"
+            }
+        } else if (op === "map_render_tile") {
+            const t = ctx.tile
+            if (r.ok && r.result && r.result.data_url && t) {
+                const src = SandboxImages.sourceFor(r.result.data_url)
+                gridModel.setProperty(t.i, "url", src)
+            } else if (t) {
+                gridModel.setProperty(t.i, "url", "")
+            }
+            root.pumpTiles()
+        }
+    }
+
+    Connections {
+        target: root.bk
+        function onLastResultChanged() {
+            if (!root.bk || !root.bk.lastResult.length) return
+            let r
+            try { r = JSON.parse(root.bk.lastResult) }
+            catch (e) { r = { ok: false, error: root.bk.lastResult } }
+            root.onResult(r)
+        }
     }
 
     // ---- Web Mercator helpers (mirror the Rust renderer) ----
@@ -57,155 +186,46 @@ Rectangle {
         return 180.0 / Math.PI * Math.atan(Math.sinh(n))
     }
 
-    function loadRegions() {
-        root.mapState = "loading-list"
-        const r = root.core("regions", {})
-        if (r.ok && r.result && r.result.regions) {
-            root.regionList = r.result.regions.map(g => ({ path: g.path, name: g.name }))
-        } else {
-            root.regionList = []
-        }
-        // Default to china/henan if present.
-        if (root.regionList.length > 0) {
-            const def = root.regionList.find(g => g.path === "china/henan")
-            regionPicker.currentIndex = root.regionList.indexOf(def || root.regionList[0])
-        }
-        root.mapState = root.regionList.length > 0 ? "idle" : "error"
-        if (root.regionList.length === 0) root.mapError = "no regions (is the osm module loaded?)"
-    }
-
-    // Resolve a region to a local PBF: look it up on-chain (cid/md5), then
-    // fetch from Logos Storage, then find the local path in the catalog.
     function startMap(region) {
         root.mapRegion = region
         root.mapState = "preparing"
-        root.mapError = ""
+        root.mapError = "resolving region on-chain…"
         root.fetchJobId = ""
-        // 1. on-chain lookup for cid + md5.
-        const lk = root.core("lookup", { region: region })
-        if (!lk.ok || !lk.result || !lk.result.latest || !lk.result.latest.cid) {
-            // No on-chain entry: fall back to the local catalog (a previously
-            // imported PBF) so the map still works offline / pre-fetch.
-            return root.prepareFromCatalog(region)
-        }
-        const latest = lk.result.latest
-        const cid = latest.cid
-        const md5 = latest.checksum || ""
-        // 2. fetch from Logos Storage by CID (job: long op).
-        const f = root.core("fetch", { region: region, cid: cid, md5_hex: md5, job: true })
-        if (f.ok && f.result && f.result.job_id) {
-            root.fetchJobId = f.result.job_id
-            root.mapState = "preparing"
-            root.mapError = "fetching region from Logos Storage…"
-            fetchPoll.running = true
-            fetchPoll.tick()
-            return
-        }
-        // Fetch refused (already running?) or sync: try the catalog.
-        root.prepareFromCatalog(region)
-    }
-
-    function prepareFromCatalog(region) {
-        const cat = root.core("catalog", {})
-        let pbf = ""
-        if (cat.ok && cat.result) {
-            const rec = cat.result.find(r => r.region === region)
-            if (rec) pbf = rec.path || ""
-        }
-        if (!pbf) {
-            root.mapState = "error"
-            root.mapError = "no local PBF for '" + region + "'. Fetch it first."
-            return
-        }
-        root.mapPbf = pbf
-        root.runPrepare(region, pbf, cat)
-    }
-
-    function runPrepare(region, pbf, cat) {
-        // Provenance from the catalog record.
-        let version = 0, md5 = "", cid = ""
-        if (cat.ok && cat.result) {
-            const rec = cat.result.find(r => r.region === region)
-            if (rec) { version = rec.version || 0; md5 = rec.md5 || ""; cid = rec.cid || "" }
-        }
-        // map_prepare kicks off a background build in the renderer core and
-        // returns immediately; we poll map_status (NOT job_status) until ready.
-        const r = root.core("map_prepare", { pbf: pbf, region: region, version: version, md5: md5, cid: cid })
-        if (!r.ok) {
-            root.mapState = "error"
-            root.mapError = (r.error || "map_prepare failed")
-            return
-        }
-        root.mapState = "preparing"
-        root.mapError = "building map index…"
-        preparePoll.running = true
-        preparePoll.tick()
-    }
-
-    // Poll a fetch job; on done, prepare the map from the fetched PBF.
-    Timer {
-        id: fetchPoll
-        interval: 1000; repeat: true
-        function tick() {
-            if (!root.fetchJobId) return
-            const r = root.core("job_status", { job_id: root.fetchJobId })
-            if (!r.ok || !r.result) return
-            const j = r.result
-            if (j.state === "running") return
-            fetchPoll.running = false
-            root.fetchJobId = ""
-            if (j.state === "done" && j.result && j.result.path) {
-                root.mapPbf = j.result.path
-                const cat = root.core("catalog", {})
-                root.runPrepare(root.mapRegion, j.result.path, cat)
-            } else {
-                root.mapState = "error"
-                root.mapError = j.error || "fetch failed"
-            }
-        }
-        onTriggered: tick()
-    }
-
-    // Poll the renderer's map_status until the build is ready (or errors).
-    Timer {
-        id: preparePoll
-        interval: 1000; repeat: true
-        function tick() {
-            const r = root.core("map_status", {})
-            if (!r.ok || !r.result) return
-            const s = r.result.state
-            if (s === "building") return
-            preparePoll.running = false
-            if (s === "ready" && r.result.info) {
-                root.mapInfo = r.result.info
-                const b = root.mapInfo.bounds || null
-                if (b) {
-                    root.centerLat = b.center_lat
-                    root.centerLon = b.center_lon
-                    root.zoom = Math.max(root.minZoom, Math.min(root.maxZoom,
-                                Math.max(2, (root.mapInfo.fit_zoom || 6) + 1)))
-                }
-                root.mapState = "ready"
-                root.viewTick++
-            } else if (s === "error") {
-                root.mapState = "error"
-                root.mapError = r.result.error || "build failed"
-            } else {
-                root.mapState = "error"
-                root.mapError = "build stopped unexpectedly"
-            }
-        }
-        onTriggered: tick()
+        fire("lookup", { region: region }, { region: region })
     }
 
     function stopMap() {
-        preparePoll.running = false; fetchPoll.running = false
-        root.core("map_stop", {})
+        statusPoll.running = false; fetchPoll.running = false
+        root.tileQueue = []
+        fire("map_stop", {})
         root.mapState = "idle"
         root.mapInfo = ({})
     }
 
-    Component.onCompleted: root.loadRegions()
+    // Poll a fetch job (osm core job_status; routed above).
+    Timer {
+        id: fetchPoll
+        interval: 1000; repeat: true
+        onTriggered: { if (root.fetchJobId && !root.pendingOp) fire("job_status", { job_id: root.fetchJobId }) }
+    }
+
+    // Poll the renderer build state (routed above).
+    Timer {
+        id: statusPoll
+        interval: 1000; repeat: true
+        function tick() { if (!root.pendingOp) fire("map_status", {}) }
+        onTriggered: tick()
+    }
+
+    Component.onCompleted: fire("open", {})
+
+    // Pump the tile queue: request the next tile (serialized, one in flight).
+    function pumpTiles() {
+        if (root.pendingOp) return
+        if (root.tileQueue.length === 0) return
+        const t = root.tileQueue.shift()
+        fire("map_render_tile", { z: t.z, x: t.x, y: t.y }, { tile: t })
+    }
 
     ColumnLayout {
         anchors.fill: parent
@@ -303,6 +323,7 @@ Rectangle {
                 const ox = viewport.vpW / 2 - (ctx - Math.floor(ctx)) * root.tileSize - halfC * root.tileSize
                 const oy = viewport.vpH / 2 - (cty - Math.floor(cty)) * root.tileSize - halfR * root.tileSize
                 gridModel.clear()
+                root.tileQueue = []
                 for (let dy = 0; dy < rows; dy++) {
                     for (let dx = 0; dx < cols; dx++) {
                         const tx = Math.floor(ctx) - halfC + dx
@@ -310,24 +331,13 @@ Rectangle {
                         const wx = ox + dx * root.tileSize
                         const wy = oy + dy * root.tileSize
                         const nx = ((tx % n) + n) % n
-                        gridModel.append({ wx: wx, wy: wy, tx: nx, ty: ty, z: z, url: "" })
+                        const inRange = ty >= 0 && ty < n
+                        const i = gridModel.count
+                        gridModel.append({ wx: wx, wy: wy, url: "" })
+                        if (inRange) root.tileQueue.push({ z: z, x: nx, y: ty, i: i })
                     }
                 }
-                // Request each tile's base64 data URL from the renderer, then
-                // register it with SandboxImages and bind the image source.
-                for (let i = 0; i < gridModel.count; i++) {
-                    const cell = gridModel.get(i)
-                    if (cell.ty < 0 || cell.ty >= n) continue
-                    requestTile(i, cell.z, cell.tx, cell.ty)
-                }
-            }
-
-            function requestTile(i, z, tx, ty) {
-                const r = root.core("map_render_tile", { z: z, x: tx, y: ty })
-                if (r.ok && r.result && r.result.data_url) {
-                    const src = SandboxImages.sourceFor(r.result.data_url)
-                    gridModel.setProperty(i, "url", src)
-                }
+                root.pumpTiles()
             }
 
             ListModel { id: gridModel }
@@ -340,8 +350,6 @@ Rectangle {
                     source: model.url
                     fillMode: Image.Pad
                     asynchronous: true
-                    Rectangle { anchors.fill: parent; color: "transparent"
-                        border.color: Qt.rgba(0.961,0.961,0.941,0.04); border.width: 1; visible: false }
                 }
             }
 
@@ -385,7 +393,7 @@ Rectangle {
                 Button { text: "−"; onClicked: { root.zoom = Math.max(root.minZoom, root.zoom-1); root.viewTick++ } }
             }
             Text { anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.margins: 8
-                text: "data distributed on Logos · renderer: osm_renderer"
+                text: "data distributed on Logos · renderer: osm_renderer_core"
                 font.family: "DejaVu Sans Mono"; font.pixelSize: 10
                 color: Qt.rgba(0.961,0.961,0.941,0.30) }
 
@@ -409,7 +417,7 @@ Rectangle {
                       ? (root.mapError || "Working…")
                       : root.mapState === "error"
                         ? root.mapError
-                        : root.mapState === "loading-list"
+                        : root.regionList.length === 0
                           ? "Loading region set…"
                           : "Pick a region and click Render map."
                 font.family: "DejaVu Sans"; font.pixelSize: 15
