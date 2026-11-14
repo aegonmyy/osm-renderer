@@ -96,12 +96,21 @@ pub struct MapIndex {
     node_count: usize,
 }
 
-/// Global renderer state: the active index. One map at a time per module
-/// process — a consumer views one region.
-static MAP: OnceLock<Mutex<Option<Arc<MapIndex>>>> = OnceLock::new();
+/// Global renderer state: the active map's build state. One map at a time per
+/// module process — a consumer views one region. `map_prepare` kicks off a
+/// background build (parsing a large PBF takes seconds) and the caller polls
+/// `map_status` until it reports `ready`.
+enum BuildState {
+    Idle,
+    Building,
+    Ready(Arc<MapIndex>),
+    Error(String),
+}
 
-fn map_lock() -> &'static Mutex<Option<Arc<MapIndex>>> {
-    MAP.get_or_init(|| Mutex::new(None))
+static MAP: OnceLock<Mutex<BuildState>> = OnceLock::new();
+
+fn map_lock() -> &'static Mutex<BuildState> {
+    MAP.get_or_init(|| Mutex::new(BuildState::Idle))
 }
 
 // ---------------------------------------------------------------------------
@@ -777,48 +786,62 @@ fn encode_png(img: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>) -> Vec<u8> {
 // FFI-facing ops (called from lib.rs dispatch)
 // ---------------------------------------------------------------------------
 
-/// `map_prepare` op: build the index from a local PBF and store it as the
-/// active map. Returns the map info (bounds, fit zoom, provenance). The caller
-/// runs this as a background job when the region is large (building parses the
-/// whole PBF).
+/// `map_prepare` op: kick off a background build of the index from a local
+/// PBF. Returns immediately with `{"started":true}`; the caller polls
+/// `map_status` until the state is `ready` (or `error`). Parsing a large PBF
+/// takes seconds, and the IPC call must not block.
 pub fn prepare(pbf: &Path, meta: MapMeta) -> Result<Value, String> {
-    let index = Arc::new(MapIndex::build(pbf, meta).map_err(|e| format!("{e:#}"))?);
-    let info = index.info();
+    // One build at a time: refuse if one is already running.
+    {
+        let g = map_lock().lock().unwrap();
+        if matches!(*g, BuildState::Building) {
+            return Err("a map build is already running".to_string());
+        }
+    }
     stop();
-    *map_lock().lock().unwrap() = Some(index);
-    Ok(json!({ "info": info }))
+    *map_lock().lock().unwrap() = BuildState::Building;
+    let pbf = pbf.to_path_buf();
+    std::thread::spawn(move || {
+        let outcome = match MapIndex::build(&pbf, meta) {
+            Ok(idx) => BuildState::Ready(Arc::new(idx)),
+            Err(e) => BuildState::Error(format!("{e:#}")),
+        };
+        *map_lock().lock().unwrap() = outcome;
+    });
+    Ok(json!({ "started": true }))
 }
 
 /// `map_render_tile` op: render one 256×256 PNG tile from the active index.
-/// Returns the raw PNG bytes; the FFI layer base64-encodes it into a data URL.
+/// Returns the raw PNG bytes; the caller base64-encodes it into a data URL.
+/// Empty when no index is ready.
 pub fn render_tile_png(z: u8, x: u32, y: u32) -> Vec<u8> {
     let g = map_lock().lock().unwrap();
-    match g.as_ref() {
-        Some(idx) => idx.render_png(z, x, y),
-        None => Vec::new(),
+    match &*g {
+        BuildState::Ready(idx) => idx.render_png(z, x, y),
+        _ => Vec::new(),
     }
 }
 
-/// `map_status` op: is a map loaded, and its provenance.
+/// `map_status` op: the build state + provenance when ready.
 pub fn status() -> Value {
     let g = map_lock().lock().unwrap();
-    match g.as_ref() {
-        Some(i) => json!({
-            "loaded": true,
-            "region": i.region,
-            "version": i.version,
-            "md5": i.md5_hex,
-            "cid": i.cid,
-            "ways": i.way_count,
-            "nodes": i.node_count,
-        }),
-        None => json!({ "loaded": false }),
+    match &*g {
+        BuildState::Idle => json!({ "state": "idle" }),
+        BuildState::Building => json!({ "state": "building" }),
+        BuildState::Error(e) => json!({ "state": "error", "error": e }),
+        BuildState::Ready(i) => {
+            let info = i.info();
+            json!({
+                "state": "ready",
+                "info": info,
+            })
+        }
     }
 }
 
-/// `map_stop` op: drop the active index.
+/// `map_stop` op: drop the active map (cancel a build's result, reset to idle).
 pub fn stop() {
-    *map_lock().lock().unwrap() = None;
+    *map_lock().lock().unwrap() = BuildState::Idle;
 }
 
 // ---------------------------------------------------------------------------

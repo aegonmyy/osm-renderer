@@ -1,0 +1,22 @@
+{
+  "name": "osm_renderer_core",
+  "version": "0.1.0",
+  "description": "Raster map renderer core: parses an OSM region PBF into a spatial index and renders Web-Mercator PNG tiles on demand. Consumed by the osm_renderer_app ui_qml app.",
+  "author": "aegonmyy",
+  "type": "core",
+  "interface": "cdylib",
+  "category": "general",
+  "main": "osm_renderer_plugin",
+  "dependencies": [],
+  "include": [],
+  "capabilities": [],
+  "codegen": {
+    "lidl": "rust-lib/osm_renderer.lidl",
+    "rust": { "crate": "rust-lib", "staticlib": "osm_renderer" }
+  },
+  "nix": {
+    "external_libraries": [],
+    "packages": { "build": [], "runtime": [] },
+    "cmake": { "find_packages": [], "extra_include_dirs": [] }
+  }
+}

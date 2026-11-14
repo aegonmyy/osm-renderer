@@ -20,6 +20,7 @@ LGX_EXPORT lgx_package_t lgx_load(const char* path);
 LGX_EXPORT lgx_result_t lgx_save(lgx_package_t pkg, const char* path);
 LGX_EXPORT lgx_result_t lgx_add_variant(lgx_package_t pkg, const char* variant,
                                         const char* files_path, const char* main_path);
+LGX_EXPORT lgx_result_t lgx_extract(lgx_package_t pkg, const char* variant, const char* output_dir);
 LGX_EXPORT lgx_result_t lgx_set_version(lgx_package_t pkg, const char* version);
 LGX_EXPORT void lgx_set_description(lgx_package_t pkg, const char* description);
 LGX_EXPORT void lgx_set_icon(lgx_package_t pkg, const char* icon);

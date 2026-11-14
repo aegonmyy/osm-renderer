@@ -9,29 +9,20 @@
   "view": "qml/Main.qml",
   "icon": "src/icons/icon.png",
   "dependencies": [
-    "osm"
-  ],
-  "include": [
-    "libosm_renderer.so"
+    "osm",
+    "osm_renderer_core"
   ],
   "nix": {
     "packages": {
       "build": [],
       "runtime": []
     },
-    "external_libraries": [
-      {
-        "name": "osm_renderer",
-        "vendor_path": "../renderer"
-      }
-    ],
+    "external_libraries": [],
     "cmake": {
       "find_packages": [],
       "extra_sources": [],
       "extra_include_dirs": [],
-      "extra_link_libraries": [
-        "dl"
-      ]
+      "extra_link_libraries": []
     }
   }
 }

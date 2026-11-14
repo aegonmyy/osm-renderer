@@ -7,81 +7,6 @@
 #include "logos_api.h"
 #include "logos_api_client.h"
 
-// Platform-agnostic dynamic loading of the renderer cdylib.
-#ifdef _WIN32
-#  include <windows.h>
-#else
-#  include <dlfcn.h>
-#endif
-
-namespace {
-using InvokeFn   = const char* (*)(const char* name, const char* argsJson);
-using VersionFn  = const char* (*)();
-using FreeFn     = void (*)(const char* ptr);
-
-// Holds the resolved C ABI of libosm_renderer.so. Loaded once, reused for the
-// process lifetime. The library sits next to this plugin (RPATH $ORIGIN) under
-// the name libosm_renderer.so / osm_renderer.dll, unless OSM_RENDERER_FFI_PATH
-// points elsewhere.
-struct RendererAbi {
-    void* lib = nullptr;
-    InvokeFn  invoke  = nullptr;
-    VersionFn version = nullptr;
-    FreeFn    free    = nullptr;
-    QString   err;
-};
-
-RendererAbi& abi()
-{
-    static RendererAbi a;
-    return a;
-}
-
-void loadAbi()
-{
-    RendererAbi& a = abi();
-    if (a.lib) return;
-
-    const char* envPath = std::getenv("OSM_RENDERER_FFI_PATH");
-#ifdef _WIN32
-    const char* kLib = "osm_renderer.dll";
-    std::string p = (envPath && *envPath) ? envPath : kLib;
-    a.lib = reinterpret_cast<void*>(::LoadLibraryA(p.c_str()));
-    if (!a.lib) { a.err = "cannot load " + QString::fromStdString(p); return; }
-    a.invoke  = reinterpret_cast<InvokeFn>(::GetProcAddress(static_cast<HMODULE>(a.lib), "osm_renderer_invoke"));
-    a.version = reinterpret_cast<VersionFn>(::GetProcAddress(static_cast<HMODULE>(a.lib), "osm_renderer_version"));
-    a.free    = reinterpret_cast<FreeFn>(::GetProcAddress(static_cast<HMODULE>(a.lib), "osm_renderer_free_string"));
-#else
-    const char* kLib = "libosm_renderer.so";
-    std::string p = (envPath && *envPath) ? envPath : kLib;
-    a.lib = ::dlopen(p.c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (!a.lib) { a.err = QString("cannot load ") + QString::fromStdString(p) + ": " + ::dlerror(); return; }
-    a.invoke  = reinterpret_cast<InvokeFn>(::dlsym(a.lib, "osm_renderer_invoke"));
-    a.version = reinterpret_cast<VersionFn>(::dlsym(a.lib, "osm_renderer_version"));
-    a.free    = reinterpret_cast<FreeFn>(::dlsym(a.lib, "osm_renderer_free_string"));
-#endif
-    if (!a.invoke || !a.version || !a.free) {
-        a.err = QStringLiteral("libosm_renderer missing C ABI symbols");
-    }
-}
-
-QString abiInvoke(const QString& name, const QString& argsJson)
-{
-    loadAbi();
-    RendererAbi& a = abi();
-    if (!a.invoke) {
-        return QStringLiteral("{\"ok\":false,\"error\":\"renderer not loaded: ")
-            + a.err + QStringLiteral("\"}");
-    }
-    const QByteArray n = name.toUtf8();
-    const QByteArray j = argsJson.toUtf8();
-    const char* res = a.invoke(n.constData(), j.constData());
-    QString out = QString::fromUtf8(res);
-    a.free(res);
-    return out;
-}
-} // namespace
-
 OsmRendererPlugin::OsmRendererPlugin(QObject* parent)
     : OsmRendererSimpleSource(parent)
 {
@@ -89,75 +14,69 @@ OsmRendererPlugin::OsmRendererPlugin(QObject* parent)
 
 OsmRendererPlugin::~OsmRendererPlugin()
 {
-    delete m_client;
+    delete m_osm;
+    delete m_render;
 }
 
 void OsmRendererPlugin::initLogos(LogosAPI* api)
 {
     m_api = api;
     setBackend(this);
-    ensureClient();
-    // Surface the renderer version in the header on startup.
-    loadAbi();
-    RendererAbi& a = abi();
-    if (a.version) {
-        const char* v = a.version();
-        setRendererVersion(QString::fromUtf8(v));
-        a.free(v);
-    } else {
-        setRendererVersion(QStringLiteral("{\"ok\":false,\"error\":\"") + a.err + QStringLiteral("\"}"));
-    }
-    QTimer::singleShot(0, this, [this]() {
-        // Nothing else to refresh at startup — the view loads the region list
-        // itself via invokeOp("regions").
-    });
+    ensureClients();
+    // Surface the renderer core's version on startup (best-effort; the replica
+    // may not be valid yet, in which case the empty string is fine).
+    QTimer::singleShot(0, this, [this]() {});
 }
 
-void OsmRendererPlugin::ensureClient()
+void OsmRendererPlugin::ensureClients()
 {
-    if (m_client || !m_api) {
+    if (m_osm && m_render) {
         return;
     }
-    // The core module is named "osm"; this replica is "osm_renderer".
-    m_client = new LogosAPIClient(
-        QStringLiteral("osm"),
-        QStringLiteral("osm_renderer"),
-        m_api->getTokenManager(),
-        this);
-}
-
-QString OsmRendererPlugin::invokeCore(const QString& method, const QVariantList& args)
-{
-    ensureClient();
-    if (!m_client) {
-        return QStringLiteral("{\"ok\":false,\"error\":\"no osm client\"}");
+    if (!m_api) {
+        return;
     }
-    switch (args.size()) {
-        case 0:
-            return m_client->invokeRemoteMethod(QStringLiteral("osm"), method).toString();
-        case 1:
-            return m_client->invokeRemoteMethod(QStringLiteral("osm"), method, args[0]).toString();
-        case 2:
-            return m_client->invokeRemoteMethod(QStringLiteral("osm"), method, args[0], args[1]).toString();
-        default:
-            return QStringLiteral("{\"ok\":false,\"error\":\"unsupported argument count\"}");
+    // This replica is "osm_renderer"; the two cores it forwards to are "osm"
+    // (the SDK) and "osm_renderer_core" (the Rust renderer).
+    if (!m_osm) {
+        m_osm = new LogosAPIClient(
+            QStringLiteral("osm"),
+            QStringLiteral("osm_renderer"),
+            m_api->getTokenManager(),
+            this);
+    }
+    if (!m_render) {
+        m_render = new LogosAPIClient(
+            QStringLiteral("osm_renderer_core"),
+            QStringLiteral("osm_renderer"),
+            m_api->getTokenManager(),
+            this);
     }
 }
 
-QString OsmRendererPlugin::invokeRenderer(const QString& name, const QString& argsJson)
+QString OsmRendererPlugin::forward(const QString& coreName, const QString& method,
+                                   const QString& name, const QString& argsJson)
 {
-    return abiInvoke(name, argsJson);
+    ensureClients();
+    LogosAPIClient* client = (coreName == QLatin1String("osm")) ? m_osm : m_render;
+    if (!client) {
+        return QStringLiteral("{\"ok\":false,\"error\":\"no %1 client\"}").arg(coreName);
+    }
+    return client->invokeRemoteMethod(coreName, method, name, argsJson).toString();
 }
 
 QString OsmRendererPlugin::invokeOp(QString name, QString argsJson)
 {
+    // map_* ops go to the renderer core's generic invoke_op; everything else
+    // (regions/lookup/fetch/catalog/open/status/...) goes to the osm core's
+    // invokeOpJson — exactly the split a consumer of both modules wants.
     QString result;
-    // map_* ops run against the local renderer cdylib; everything else is
-    // forwarded to the osm core (regions/lookup/fetch/catalog/open/...).
     if (name.startsWith(QStringLiteral("map_"))) {
-        result = invokeRenderer(name, argsJson);
+        result = forward(QStringLiteral("osm_renderer_core"),
+                         QStringLiteral("invoke_op"), name, argsJson);
     } else {
-        result = invokeCore(QStringLiteral("invokeOpJson"), QVariantList{ name, argsJson });
+        result = forward(QStringLiteral("osm"),
+                         QStringLiteral("invokeOpJson"), name, argsJson);
     }
     setLastResult(result);
 

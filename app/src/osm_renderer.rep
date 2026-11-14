@@ -1,12 +1,13 @@
 // RemoteObjects source definition for the osm_renderer ("Map Viewer") app.
 //
-// Like osm_app, the app is a thin replica: it forwards OSM operations
-// (regions/lookup/fetch/catalog/...) to the core `osm` module over
-// RemoteObjects, and it handles the map_* operations locally by dlopening
-// libosm_renderer.so (the standalone raster renderer) and calling its C ABI.
+// The app is a thin replica, exactly like osm_app: it forwards operations to
+// core modules over RemoteObjects. `map_*` ops go to the `osm_renderer` core
+// (via its generic invoke_op); osm ops (regions/lookup/fetch/catalog/open/...)
+// go to the `osm` core (via its invokeOpJson). QML calls invokeOp(name,
+// argsJson) and parses the returned JSON.
 class OsmRenderer
 {
-    // Renderer version JSON.
+    // Renderer core version JSON.
     PROP(QString rendererVersion READWRITE)
 
     // Last operation result JSON.
@@ -16,8 +17,6 @@ class OsmRenderer
     PROP(QString lastErr READWRITE)
 
     // Invoke an operation by name with JSON arguments; returns the JSON result.
-    // osm ops (regions/lookup/fetch/catalog/...) are forwarded to the osm core;
-    // map_* ops (map_prepare/map_render_tile/map_status/map_stop) run against
-    // the local renderer cdylib.
+    // map_* ops are forwarded to the osm_renderer core; everything else to osm.
     SLOT(QString invokeOp(QString name, QString argsJson))
 }

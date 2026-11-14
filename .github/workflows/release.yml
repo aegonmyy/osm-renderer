@@ -15,42 +15,43 @@ permissions:
 
 jobs:
   build-lgx:
-    name: Build osm_renderer .lgx (${{ matrix.target }})
+    name: Build ${{ matrix.module }} .lgx (${{ matrix.target }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: linux-amd64
-            nix_system: x86_64-linux
-          - target: windows-x86_64
-            nix_system: x86_64-windows
+        target: [linux-amd64, windows-x86_64]
+        module: [renderer, app]
+        exclude:
+          # The renderer core is a Rust cdylib; the windows variant is produced
+          # by the builder's mingw cross-build (x86_64-windows). Both legs
+          # build it; this matrix just names them.
+          - module: renderer
+            target: irrelevant
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: false
 
       - name: Install Nix
         uses: cachix/install-nix-action@v30
         with:
           nix_path: nixpkgs=channel:nixos-unstable
 
-      - name: Build .lgx (portable)
-        working-directory: app
+      - name: Build ${{ matrix.module }} .lgx (portable)
+        working-directory: ${{ matrix.module }}
         run: |
-          nix build ".#lgx-portable" \
-            --override-input logos-osm github:aegonmyy/logos-osm \
-            --print-out-paths --no-link
-          out=$(cat result)
+          nix build ".#lgx-portable" --print-out-paths --no-link
+          out="$(readlink -f result)"
           lgx=$(find "$out" -maxdepth 2 -name '*.lgx' | head -n1)
           if [[ -z "$lgx" ]]; then echo "::error::nix build produced no .lgx"; exit 1; fi
           mkdir -p "$GITHUB_WORKSPACE/_artifacts"
-          cp "$lgx" "$GITHUB_WORKSPACE/_artifacts/osm_renderer-${{ matrix.target }}.lgx"
+          name="osm_renderer"
+          [[ "${{ matrix.module }}" == "renderer" ]] && name="osm_renderer_core"
+          cp "$lgx" "$GITHUB_WORKSPACE/_artifacts/${name}-${{ matrix.target }}.lgx"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: osm_renderer-${{ matrix.target }}
-          path: _artifacts/osm_renderer-${{ matrix.target }}.lgx
+          name: ${{ matrix.module }}-${{ matrix.target }}
+          path: _artifacts/*.lgx
           if-no-files-found: error
 
   release:
