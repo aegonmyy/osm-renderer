@@ -41,8 +41,7 @@ jobs:
           set -euo pipefail
           # --print-out-paths prints the store path; --no-link avoids creating
           # a `result` symlink (so we must NOT readlink `result`).
-          out=$(nix build ".#${LGX_ATTR}" --print-out-paths --no-link \
-                  --override-input osm-renderer-core github:aegonmyy/osm-renderer?dir=renderer)
+          out=$(nix build ".#${LGX_ATTR}" --print-out-paths --no-link)
           lgx=$(find "$out" -maxdepth 2 -name '*.lgx' | head -n1)
           if [[ -z "$lgx" ]]; then echo "::error::nix build produced no .lgx (out=$out)"; exit 1; fi
           mkdir -p "$GITHUB_WORKSPACE/_artifacts"

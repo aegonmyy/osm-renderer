@@ -105,7 +105,7 @@ fn dispatch(name: &str, args: &Value) -> Value {
 #[derive(Default)]
 struct RendererImpl;
 
-impl OsmRendererCore for RendererImpl {
+impl OsmRendererCoreModule for RendererImpl {
     /// Generic op dispatch: `name` is one of map_prepare/map_render_tile/
     /// map_status/map_stop; `args` is a JSON object string. Returns a JSON
     /// result string tagged with the op name.

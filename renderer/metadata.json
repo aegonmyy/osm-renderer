@@ -11,7 +11,7 @@
   "include": [],
   "capabilities": [],
   "codegen": {
-    "lidl": "rust-lib/osm_renderer.lidl",
+    "lidl": "rust-lib/osm_renderer_core.lidl",
     "rust": { "crate": "rust-lib", "staticlib": "osm_renderer" }
   },
   "nix": {

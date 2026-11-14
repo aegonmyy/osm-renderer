@@ -1,0 +1,5 @@
+module osm_renderer_core {
+  version "0.1.0"
+  description "Raster map renderer core: parses an OSM region PBF into a spatial index and renders Web-Mercator PNG tiles on demand."
+  method invoke_op(name: tstr, args: tstr) -> tstr
+}
