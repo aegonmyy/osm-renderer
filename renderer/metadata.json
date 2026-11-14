@@ -6,7 +6,7 @@
   "type": "core",
   "interface": "cdylib",
   "category": "general",
-  "main": "osm_renderer_plugin",
+  "main": "osm_renderer_core_plugin",
   "dependencies": [],
   "include": [],
   "capabilities": [],
