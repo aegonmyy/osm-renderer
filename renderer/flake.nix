@@ -5,7 +5,7 @@
     nixpkgs.follows = "logos-module-builder/nixpkgs";
     # Provides logos-lidl-gen (the contract->scaffold generator the builder
     # runs) and the SDK the crate links. One extra input vs a C++ module.
-    logos-rust-sdk.url = "github:logos-co/logos-rust-sdk";
+    logos-rust-sdk.url = "github:logos-co/logos-rust-sdk/49dbb0768a9a18cfaf264cc3ecfa55cca2630157";
     logos-rust-sdk.inputs.logos-module-builder.follows = "logos-module-builder";
   };
   outputs = inputs@{ self, logos-module-builder, ... }:
